@@ -8,6 +8,7 @@ from . import filters
 from wcmatch import glob
 import codecs
 from collections import namedtuple
+from concurrent.futures import as_completed, ProcessPoolExecutor
 
 __all__ = ("spellcheck",)
 
@@ -67,7 +68,7 @@ class SpellChecker:
         "O": glob.O
     }
 
-    def __init__(self, config, binary='', verbose=0, debug=False):
+    def __init__(self, config, binary='', verbose=0, debug=False, jobs=1):
         """Initialize."""
 
         # General options
@@ -76,10 +77,17 @@ class SpellChecker:
         self.dict_bin = os.path.abspath(self.DICTIONARY)
         self.debug = debug
         self.default_encoding = ''
+        self.jobs = jobs
 
     def log(self, text, level):
         """Log level."""
         if self.verbose >= level:
+            print(text)
+
+    @staticmethod
+    def static_log(text, level, verbose):
+        """Log level."""
+        if verbose >= level:
             print(text)
 
     def get_error(self, e):
@@ -89,7 +97,16 @@ class SpellChecker:
 
         return traceback.format_exc() if self.debug else str(e)
 
-    def setup_command(self, encoding, options, personal_dict, file_name=None):
+    @staticmethod
+    def static_get_error(e, debug):
+        """Get the error."""
+
+        import traceback
+
+        return traceback.format_exc() if debug else str(e)
+
+    @staticmethod
+    def setup_command(binary, encoding, options, personal_dict, file_name=None):
         """Setup the command."""
 
         return []
@@ -137,40 +154,47 @@ class SpellChecker:
                 # Binary content
                 yield source
 
+    @staticmethod
+    def _check(args):
+        binary, log_fn, verbose, get_error_fn, debug, setup_command, source, options, personal_dict = args
+        # Don't waste time on empty strings
+        if source._has_error():
+            return Results([], source.context, source.category, source.error)
+        elif not source.text or source.text.isspace():
+            return
+        else:
+            encoding = source.encoding
+            if source._is_bytes():
+                text = source.text
+            else:
+                # UTF-16 and UTF-32 don't work well with Aspell and Hunspell,
+                # so encode with the compatible UTF-8 instead.
+                if encoding.startswith(('utf-16', 'utf-32')):
+                    encoding = 'utf-8'
+                text = source.text.encode(encoding)
+            log_fn('', 3, verbose)
+            log_fn(text, 3, verbose)
+            cmd = setup_command(binary, encoding, options, personal_dict)
+            log_fn("Command: " + str(cmd), 4, verbose)
+
+            try:
+                wordlist = util.call_spellchecker(cmd, input_text=text, encoding=encoding)
+                return Results(
+                    [w for w in sorted(set(wordlist.replace('\r', '').split('\n'))) if w],
+                    source.context,
+                    source.category
+                )
+            except Exception as e:  # pragma: no cover
+                err = get_error_fn(e, debug)
+                return Results([], source.context, source.category, err)
+
     def _spelling_pipeline(self, sources, options, personal_dict):
         """Check spelling pipeline."""
-
-        for source in self._pipeline_step(sources, options, personal_dict):
-            # Don't waste time on empty strings
-            if source._has_error():
-                yield Results([], source.context, source.category, source.error)
-            elif not source.text or source.text.isspace():
-                continue
-            else:
-                encoding = source.encoding
-                if source._is_bytes():
-                    text = source.text
-                else:
-                    # UTF-16 and UTF-32 don't work well with Aspell and Hunspell,
-                    # so encode with the compatible UTF-8 instead.
-                    if encoding.startswith(('utf-16', 'utf-32')):
-                        encoding = 'utf-8'
-                    text = source.text.encode(encoding)
-                self.log('', 3)
-                self.log(text, 3)
-                cmd = self.setup_command(encoding, options, personal_dict)
-                self.log("Command: " + str(cmd), 4)
-
-                try:
-                    wordlist = util.call_spellchecker(cmd, input_text=text, encoding=encoding)
-                    yield Results(
-                        [w for w in sorted(set(wordlist.replace('\r', '').split('\n'))) if w],
-                        source.context,
-                        source.category
-                    )
-                except Exception as e:  # pragma: no cover
-                    err = self.get_error(e)
-                    yield Results([], source.context, source.category, err)
+        with ProcessPoolExecutor(max_workers=self.jobs) as p:
+            args = ((self.binary, self.static_log, self.verbose, self.static_get_error, self.debug, self.setup_command, source, options, personal_dict) for source in self._pipeline_step(sources, options, personal_dict))
+            for result in p.map(self._check, args):
+                if result:
+                    yield result
 
     def spell_check_no_pipeline(self, sources, options, personal_dict):
         """Spell check without the pipeline."""
@@ -324,10 +348,10 @@ class SpellChecker:
 class Aspell(SpellChecker):
     """Aspell spell check class."""
 
-    def __init__(self, config, binary='', verbose=0, debug=False):
+    def __init__(self, config, binary='', verbose=0, debug=False, jobs=1):
         """Initialize."""
 
-        super().__init__(config, binary, verbose, debug)
+        super().__init__(config, binary, verbose, debug, jobs)
         self.binary = binary if binary else 'aspell'
 
     def setup_spellchecker(self, task):
@@ -415,7 +439,7 @@ class Aspell(SpellChecker):
             self.log('', 3)
             self.log(content, 3)
 
-            cmd = self.setup_command(source.encoding, options, personal_dict, source.context)
+            cmd = self.setup_command(self.binary, source.encoding, options, personal_dict, source.context)
             self.log("Command: " + str(cmd), 4)
             try:
                 wordlist = util.call_spellchecker(cmd, input_text=content, encoding=source.encoding)
@@ -428,11 +452,12 @@ class Aspell(SpellChecker):
                 err = self.get_error(e)
                 yield Results([], source.context, source.category, err)
 
-    def setup_command(self, encoding, options, personal_dict, file_name=None):
+    @staticmethod
+    def setup_command(binary, encoding, options, personal_dict, file_name=None):
         """Setup the command."""
 
         cmd = [
-            self.binary,
+            binary,
             'list'
         ]
 
@@ -480,10 +505,10 @@ class Aspell(SpellChecker):
 class Hunspell(SpellChecker):
     """Hunspell spell check class."""
 
-    def __init__(self, config, binary='', verbose=0, debug=False):
+    def __init__(self, config, binary='', verbose=0, debug=False, jobs=1):
         """Initialize."""
 
-        super().__init__(config, binary, verbose, debug)
+        super().__init__(config, binary, verbose, debug, jobs)
         self.binary = binary if binary else 'hunspell'
 
     def setup_spellchecker(self, task):
@@ -538,7 +563,7 @@ class Hunspell(SpellChecker):
             if source._has_error():  # pragma: no cover
                 yield Results([], source.context, source.category, source.error)
 
-            cmd = self.setup_command(source.encoding, options, personal_dict, source.context)
+            cmd = self.setup_command(self.binary, source.encoding, options, personal_dict, source.context)
             self.log('', 3)
             self.log("Command: " + str(cmd), 4)
             try:
@@ -552,11 +577,12 @@ class Hunspell(SpellChecker):
                 err = self.get_error(e)
                 yield Results([], source.context, source.category, err)
 
-    def setup_command(self, encoding, options, personal_dict, file_name=None):
+    @staticmethod
+    def setup_command(binary, encoding, options, personal_dict, file_name=None):
         """Setup command."""
 
         cmd = [
-            self.binary,
+            binary,
             '-l'
         ]
 
@@ -607,7 +633,7 @@ def iter_tasks(matrix, names, groups):
             yield task
 
 
-def spellcheck(config_file, names=None, groups=None, binary='', checker='', sources=None, verbose=0, debug=False):
+def spellcheck(config_file, names=None, groups=None, binary='', checker='', sources=None, verbose=0, debug=False, jobs=1):
     """Spell check."""
 
     hunspell = None
@@ -648,12 +674,12 @@ def spellcheck(config_file, names=None, groups=None, binary='', checker='', sour
 
         if checker == "hunspell":  # pragma: no cover
             if hunspell is None:
-                hunspell = Hunspell(config, binary, verbose, debug)
+                hunspell = Hunspell(config, binary, verbose, debug, jobs)
             spellchecker = hunspell
 
         elif checker == "aspell":
             if aspell is None:
-                aspell = Aspell(config, binary, verbose, debug)
+                aspell = Aspell(config, binary, verbose, debug, jobs)
             spellchecker = aspell
         else:
             raise ValueError('%s is not a valid spellchecker!' % checker)
